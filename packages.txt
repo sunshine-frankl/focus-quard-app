@@ -1,0 +1,4 @@
+cmake
+build-essential
+libopenblas-dev
+liblapack-dev
