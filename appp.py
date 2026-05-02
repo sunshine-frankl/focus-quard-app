@@ -16,7 +16,15 @@ from streamlit_webrtc import (
     WebRtcMode,
     webrtc_streamer,
 )
+import os, urllib.request, bz2
 
+DAT_PATH = "shape_predictor_68_face_landmarks.dat"
+if not os.path.exists(DAT_PATH):
+    url = "https://github.com/davisking/dlib-models/raw/master/shape_predictor_68_face_landmarks.dat.bz2"
+    urllib.request.urlretrieve(url, DAT_PATH + ".bz2")
+    with bz2.open(DAT_PATH + ".bz2") as f_in, open(DAT_PATH, "wb") as f_out:
+        f_out.write(f_in.read())
+    os.remove(DAT_PATH + ".bz2")
 
 TELEGRAM_BOT_TOKEN = "8702324957:AAE45czlrbs5nt9q7uxxwgukArUpNjoZ-j0"
 TELEGRAM_CHAT_ID   = "-1003964944926"
