@@ -1,1 +1,2 @@
 cmake
+python3-dev
