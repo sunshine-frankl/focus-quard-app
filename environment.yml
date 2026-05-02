@@ -4,4 +4,17 @@ channels:
   - defaults
 dependencies:
   - python=3.11
-  - dlib
+  - dlib=19.24.2
+  - opencv
+  - numpy
+  - scipy
+  - pip
+  - pip:
+    - streamlit
+    - streamlit-webrtc
+    - av
+    - ultralytics
+    - torch
+    - torchvision
+    - plotly
+    - requests
