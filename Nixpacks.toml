@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["libglib", "libgomp1"]
+nixPkgs = ["glib", "libgcc"]
 
 [phases.install]
 cmds = ["pip install --no-cache-dir --force-reinstall -r requirements.txt"]
