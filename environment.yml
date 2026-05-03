@@ -5,16 +5,21 @@ channels:
 dependencies:
   - python=3.11
   - dlib=19.24.2
-  - opencv
   - numpy
   - scipy
   - pip
   - pip:
+    - opencv-python-headless
     - streamlit
     - streamlit-webrtc
     - av
-    - ultralytics==8.4.46
+    - ultralytics==8.4.46 --no-deps
     - torch
     - torchvision
     - plotly
     - requests
+    - matplotlib
+    - psutil
+    - pyyaml
+    - polars
+    - ultralytics-thop
