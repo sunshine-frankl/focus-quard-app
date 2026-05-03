@@ -1,0 +1,7 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "startCommand": "streamlit run app.py --server.port $PORT --server.address 0.0.0.0",
+    "aptPackages": ["libgl1", "libglib2.0-0"]
+  }
+}
