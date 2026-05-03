@@ -13,7 +13,7 @@ dependencies:
     - streamlit
     - streamlit-webrtc
     - av
-    - ultralytics
+    - ultralytics==8.4.46
     - torch
     - torchvision
     - plotly
