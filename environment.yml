@@ -1,0 +1,25 @@
+name: focus-guard
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - dlib
+  - scipy
+  - numpy=1.26.4
+  - pip:
+    - streamlit
+    - streamlit-webrtc
+    - mediapipe
+    - av
+    - ultralytics==8.4.46
+    - torch
+    - torchvision
+    - plotly
+    - requests
+    - matplotlib
+    - psutil
+    - pyyaml
+    - polars
+    - ultralytics-thop
