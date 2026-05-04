@@ -18,13 +18,24 @@ TELEGRAM_CHAT_ID   = "-1003964944926"
 
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
+        {"urls": "stun:stun.relay.metered.ca:80"},
         {
-            "urls": ["turn:focus-guardian.metered.live:80?transport=tcp"],
+            "urls": "turn:global.relay.metered.ca:80",
             "username": "11825cb12697cebbbaf737fb",
             "credential": "C5RojbMQe3DbPLhb",
         },
         {
-            "urls": ["turns:focus-guardian.metered.live:443?transport=tcp"],
+            "urls": "turn:global.relay.metered.ca:80?transport=tcp",
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+        {
+            "urls": "turn:global.relay.metered.ca:443",
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+        {
+            "urls": "turns:global.relay.metered.ca:443?transport=tcp",
             "username": "11825cb12697cebbbaf737fb",
             "credential": "C5RojbMQe3DbPLhb",
         },
