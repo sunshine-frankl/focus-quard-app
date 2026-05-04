@@ -2,17 +2,36 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 import time
+from collections import deque
 import plotly.graph_objects as go
 import threading
 import queue
 import io
 import hashlib
 import uuid
+import av
+from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, WebRtcMode, webrtc_streamer
 
 TELEGRAM_BOT_TOKEN = "8702324957:AAE45czlrbs5nt9q7uxxwgukArUpNjoZ-j0"
 TELEGRAM_CHAT_ID   = "-1003964944926"
+
+# ── TURN сервер проверен и работает ───────────────────────────────────────────
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {
+            "urls": "turn:global.relay.metered.ca:80?transport=tcp",
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+        {
+            "urls": "turns:global.relay.metered.ca:443?transport=tcp",
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+    ],
+    "iceTransportPolicy": "relay",
+})
 
 EAR_THRESHOLD      = 0.20
 EAR_CONSEC_FRAMES  = 3
@@ -47,14 +66,12 @@ def iris_ratio(lm, iris_idx, left_idx, right_idx, w, h):
     return 0.5 if abs(d) < 1 else (ix-el)/d
 
 
-@st.cache_resource
-def get_face_mesh():
+def load_face_mesh():
     return mp.solutions.face_mesh.FaceMesh(
         max_num_faces=4, refine_landmarks=True,
         min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-@st.cache_resource
-def get_yolo():
+def load_yolo():
     try:
         from ultralytics import YOLO
         return YOLO(YOLO_MODEL)
@@ -71,6 +88,7 @@ def get_notifier():
     class _N:
         def __init__(self):
             self._q = queue.Queue(maxsize=20)
+            self.total_sent = 0
             threading.Thread(target=self._loop, daemon=True).start()
         def send(self, img, cap):
             if not (_req and TELEGRAM_BOT_TOKEN): return
@@ -82,81 +100,117 @@ def get_notifier():
                 try:
                     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     if ok:
-                        _req.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                            data={"chat_id":TELEGRAM_CHAT_ID,"caption":cap,"parse_mode":"Markdown"},
-                            files={"photo":("v.jpg",io.BytesIO(buf.tobytes()),"image/jpeg")},
+                        r = _req.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                            data={"chat_id": TELEGRAM_CHAT_ID, "caption": cap,
+                                  "parse_mode": "Markdown"},
+                            files={"photo": ("v.jpg", io.BytesIO(buf.tobytes()), "image/jpeg")},
                             timeout=15)
+                        if r.status_code == 200:
+                            self.total_sent += 1
                 except Exception: pass
                 finally: self._q.task_done()
     return _N()
 
 
-def make_state():
-    return {
-        "started":         False,
-        "session_start":   None,
-        "total_blinks":    0,
-        "frame_counter":   0,
-        "last_blink_time": time.time(),
-        "focus_scores":    [],
-        "violations_log":  [],
-        "vio_first":       {},
-        "vio_sent":        {},
-        "gaze_buf":        [],
-        "focus_score":     0,
-        "gaze_ui":         "—",
-        "blink_rate":      0.0,
-        "status":          "⏸ Press START",
-        "color":           "#555555",
-        "active_violations": [],
-        "last_ann":        None,
-    }
+# ══════════════════════════════════════════════════════════════════════════════
+#  VIDEO PROCESSOR
+# ══════════════════════════════════════════════════════════════════════════════
+class FocusProcessor(VideoProcessorBase):
+    def __init__(self):
+        self._lock           = threading.Lock()
+        self.settings        = {}
+        self.face_mesh       = load_face_mesh()
+        self.yolo            = load_yolo()
+        self.notifier        = get_notifier()
+        self.session_start   = time.time()
+        self.total_blinks    = 0
+        self.frame_counter   = 0
+        self.last_blink_time = time.time()
+        self.focus_scores    = deque(maxlen=400)
+        self.yolo_cnt        = 0
+        self.yolo_objects    = []
+        self.violations_log  = deque(maxlen=20)
+        self._vio_first      = {}
+        self._vio_sent       = {}
+        self._gaze_buf       = deque(maxlen=6)
+        self.last = {
+            "focus_score": 0, "gaze": "—", "blink_rate": 0.0,
+            "session_time": 0, "status": "INIT", "color": "#aaaaaa",
+            "active_violations": [], "focus_scores": [],
+        }
 
+    def update_settings(self, s):
+        with self._lock:
+            self.settings = s.copy()
 
-def process_frame(img_bytes, state, settings):
-    try:
-        arr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return state
+    def _vio_check(self, active):
+        now = time.time()
+        active_types = {v[0] for v in active}
+        for t in list(self._vio_first):
+            if t not in active_types:
+                del self._vio_first[t]
+        grace = {"person_absent": ABSENCE_GRACE_SEC,
+                 "gaze_away": GAZE_GRACE_SEC,
+                 "extra_face": 1.0}
+        out = []
+        for vtype, vtext in active:
+            if vtype not in self._vio_first:
+                self._vio_first[vtype] = now
+                continue
+            if now - self._vio_first[vtype] < grace.get(vtype, 0.6):
+                continue
+            if now - self._vio_sent.get(vtype, 0) < VIOLATION_COOLDOWN:
+                continue
+            self._vio_sent[vtype] = now
+            out.append((vtype, vtext))
+        return out
 
-        h, w  = img.shape[:2]
-        rgb   = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        res   = get_face_mesh().process(rgb)
-        ann   = img.copy()
+    def recv(self, frame):
+        img = cv2.flip(frame.to_ndarray(format="bgr24"), 1)
+        h, w = img.shape[:2]
+        with self._lock:
+            settings = self.settings.copy()
 
-        faces_count   = len(res.multi_face_landmarks) if res.multi_face_landmarks else 0
+        rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        faces_count   = len(results.multi_face_landmarks) if results.multi_face_landmarks else 0
         person_absent = faces_count == 0
-        gaze_cv, gaze_ui = ("No person","🚫 None") if person_absent else ("Center","👀 Center")
+        gaze_cv, gaze_ui = ("No person", "🚫 None") if person_absent else ("Center", "👀 Center")
 
-        if res.multi_face_landmarks:
-            for face_lm in res.multi_face_landmarks:
+        ann = img.copy()
+
+        if results.multi_face_landmarks:
+            for face_lm in results.multi_face_landmarks:
                 lm = face_lm.landmark
+
                 xs = [int(l.x*w) for l in lm]
                 ys = [int(l.y*h) for l in lm]
-                cv2.rectangle(ann,(max(0,min(xs)-8),max(0,min(ys)-8)),
-                              (min(w,max(xs)+8),min(h,max(ys)+8)),(0,255,120),2)
+                cv2.rectangle(ann,
+                    (max(0,min(xs)-8), max(0,min(ys)-8)),
+                    (min(w,max(xs)+8), min(h,max(ys)+8)),
+                    (0,255,120), 2)
                 for idx in L_EAR_IDX+R_EAR_IDX:
                     cv2.circle(ann,(int(lm[idx].x*w),int(lm[idx].y*h)),2,(0,255,255),-1)
-                for ii in [L_IRIS_IDX,R_IRIS_IDX]:
+                for ii in [L_IRIS_IDX, R_IRIS_IDX]:
                     cv2.circle(ann,(int(lm[ii].x*w),int(lm[ii].y*h)),5,(255,80,80),-1)
 
-                avg_ear = (ear(lm,L_EAR_IDX,w,h)+ear(lm,R_EAR_IDX,w,h))/2.0
+                avg_ear = (ear(lm,L_EAR_IDX,w,h) + ear(lm,R_EAR_IDX,w,h)) / 2.0
                 if avg_ear < EAR_THRESHOLD:
-                    state["frame_counter"] += 1
-                    if (state["frame_counter"] >= EAR_CONSEC_FRAMES
-                            and time.time()-state["last_blink_time"] > 0.4):
-                        state["total_blinks"] += 1
-                        state["last_blink_time"] = time.time()
+                    self.frame_counter += 1
+                    if (self.frame_counter >= EAR_CONSEC_FRAMES
+                            and time.time()-self.last_blink_time > 0.4):
+                        self.total_blinks += 1
+                        self.last_blink_time = time.time()
                 else:
-                    state["frame_counter"] = 0
+                    self.frame_counter = 0
 
-                lr = iris_ratio(lm,L_IRIS_IDX,L_EYE_LEFT,L_EYE_RIGHT,w,h)
-                rr = iris_ratio(lm,R_IRIS_IDX,R_EYE_LEFT,R_EYE_RIGHT,w,h)
-                buf = state["gaze_buf"]
-                buf.append((lr+rr)/2.0)
-                if len(buf) > 6: buf.pop(0)
-                smooth = sum(buf)/len(buf)
+                lr = iris_ratio(lm, L_IRIS_IDX, L_EYE_LEFT, L_EYE_RIGHT, w, h)
+                rr = iris_ratio(lm, R_IRIS_IDX, R_EYE_LEFT, R_EYE_RIGHT, w, h)
+                self._gaze_buf.append((lr+rr)/2.0)
+                smooth = sum(self._gaze_buf)/len(self._gaze_buf)
+
                 if   smooth < 0.5-GAZE_THRESHOLD: gaze_cv,gaze_ui = "Left","👈 Left"
                 elif smooth > 0.5+GAZE_THRESHOLD: gaze_cv,gaze_ui = "Right","👉 Right"
                 else:
@@ -164,86 +218,87 @@ def process_frame(img_bytes, state, settings):
                     if dev > GAZE_THRESHOLD*0.6:
                         side  = "Left" if smooth < 0.5 else "Right"
                         arrow = "👈"   if smooth < 0.5 else "👉"
-                        gaze_cv,gaze_ui = f"Slight {side}",f"{arrow} Slight {side}"
+                        gaze_cv,gaze_ui = f"Slight {side}", f"{arrow} Slight {side}"
                     else:
                         gaze_cv,gaze_ui = "Center","👀 Center"
         else:
-            state["gaze_buf"] = []
+            self._gaze_buf.clear()
 
-        yolo_objects = []
-        yolo = get_yolo()
-        if settings.get("enable_yolo") and yolo:
-            try:
-                res2 = yolo.predict(img,imgsz=416,conf=YOLO_CONF,verbose=False)
-                if res2 and res2[0].boxes is not None:
-                    for box,cf,cid in zip(res2[0].boxes.xyxy.cpu().numpy(),
-                                          res2[0].boxes.conf.cpu().numpy(),
-                                          res2[0].boxes.cls.cpu().numpy().astype(int)):
-                        name = yolo.names.get(int(cid),str(cid))
-                        if name in SUSPICIOUS_OBJECTS:
-                            bx1,by1,bx2,by2 = box.astype(int)
-                            yolo_objects.append({"class":name,"conf":float(cf),
-                                                 "box":(int(bx1),int(by1),int(bx2),int(by2))})
-            except Exception: pass
-        for obj in yolo_objects:
+        # YOLO
+        if settings.get("enable_yolo") and self.yolo:
+            self.yolo_cnt += 1
+            if self.yolo_cnt >= 5:
+                self.yolo_cnt = 0
+                try:
+                    res = self.yolo.predict(img, imgsz=416, conf=YOLO_CONF, verbose=False)
+                    self.yolo_objects = []
+                    if res and res[0].boxes is not None:
+                        for box,cf,cid in zip(res[0].boxes.xyxy.cpu().numpy(),
+                                              res[0].boxes.conf.cpu().numpy(),
+                                              res[0].boxes.cls.cpu().numpy().astype(int)):
+                            name = self.yolo.names.get(int(cid), str(cid))
+                            if name in SUSPICIOUS_OBJECTS:
+                                bx1,by1,bx2,by2 = box.astype(int)
+                                self.yolo_objects.append({
+                                    "class": name, "conf": float(cf),
+                                    "box": (int(bx1),int(by1),int(bx2),int(by2))})
+                except Exception:
+                    pass
+        for obj in self.yolo_objects:
             bx1,by1,bx2,by2 = obj["box"]
             cv2.rectangle(ann,(bx1,by1),(bx2,by2),(0,0,255),2)
             cv2.putText(ann,f"{obj['class']} {obj['conf']:.2f}",(bx1+2,by1-6),
                         cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2)
 
-        session_time = max(1, time.time()-state["session_start"])
-        blink_rate   = (state["total_blinks"]/session_time)*60
+        # Score
+        session_time = max(1, time.time()-self.session_start)
+        blink_rate   = (self.total_blinks/session_time)*60
         score = max(15, min(100,
             92 - (77 if person_absent else 0)
                - (35 if not person_absent and "Center" not in gaze_cv else 0)
                - max(0,(blink_rate-MAX_BLINK_RATE)*0.8)
                - (40 if faces_count > 1 else 0)
-               - len(yolo_objects)*25))
-        state["focus_scores"].append(score)
-        if len(state["focus_scores"]) > 400:
-            state["focus_scores"] = state["focus_scores"][-400:]
+               - len(self.yolo_objects)*25))
+        self.focus_scores.append(score)
 
-        now = time.time()
+        # Violations
         active = []
         if settings.get("track_absence") and person_absent:
             active.append(("person_absent","🚫 Person absent"))
         if settings.get("track_gaze") and not person_absent and "Center" not in gaze_cv:
-            active.append(("gaze_away",gaze_ui))
+            active.append(("gaze_away", gaze_ui))
         if settings.get("track_extra") and faces_count > 1:
-            active.append(("extra_face",f"👥 {faces_count} faces"))
-        for obj in yolo_objects:
+            active.append(("extra_face", f"👥 {faces_count} faces detected"))
+        for obj in self.yolo_objects:
             cls = obj["class"]
             if settings.get("track_phone") and cls in ("cell phone","remote"):
-                active.append(("phone",f"📱 Phone ({obj['conf']:.2f})"))
-            elif settings.get("track_book") and cls=="book":
-                active.append(("book",f"📚 Book ({obj['conf']:.2f})"))
+                active.append(("phone", f"📱 Phone detected ({obj['conf']:.2f})"))
+            elif settings.get("track_book") and cls == "book":
+                active.append(("book", f"📚 Book detected ({obj['conf']:.2f})"))
             elif settings.get("track_objects") and cls in ("laptop","tv"):
-                active.append((cls,f"💻 {cls.capitalize()} ({obj['conf']:.2f})"))
+                active.append((cls, f"💻 {cls.capitalize()} detected ({obj['conf']:.2f})"))
 
-        active_types = {v[0] for v in active}
-        for t in list(state["vio_first"]):
-            if t not in active_types: del state["vio_first"][t]
-        grace = {"person_absent":ABSENCE_GRACE_SEC,"gaze_away":GAZE_GRACE_SEC,"extra_face":1.0}
-        for vtype,vtext in active:
-            if vtype not in state["vio_first"]: state["vio_first"][vtype]=now; continue
-            if now-state["vio_first"][vtype] < grace.get(vtype,0.6): continue
-            if now-state["vio_sent"].get(vtype,0) < VIOLATION_COOLDOWN: continue
-            state["vio_sent"][vtype] = now
+        for _, vtext in self._vio_check(active):
             ts = time.strftime("%H:%M:%S")
-            state["violations_log"].insert(0,f"[{ts}] {vtext}")
-            if len(state["violations_log"]) > 20:
-                state["violations_log"] = state["violations_log"][:20]
+            self.violations_log.appendleft(f"[{ts}] {vtext}")
             if settings.get("enable_telegram"):
-                get_notifier().send(ann,
-                    f"🚨 *Violation*\n👤 {settings.get('student_name','?')}\n"
-                    f"⏰ {ts}\n📋 {vtext}\n📉 Focus: {int(score)}%")
+                caption = (
+                    f"🚨 *Violation Detected*\n"
+                    f"👤 Student: {settings.get('student_name','?')}\n"
+                    f"⏰ Time: {ts}\n"
+                    f"📋 Type: {vtext}\n"
+                    f"📉 Focus Score: {int(score)}%"
+                )
+                self.notifier.send(ann, caption)
 
-        if   person_absent:  status,color = "🔴 No person",  "#ff4444"
-        elif active:         status,color = "🔴 Violation",  "#ff4444"
-        elif score > 78:     status,color = "🟢 Focused",    "#00ff9d"
-        elif score > 55:     status,color = "🟡 Drifting",   "#ffcc00"
-        else:                status,color = "🔴 Not focused","#ff4444"
+        # Status
+        if   person_absent: status,color = "🔴 No person",  "#ff4444"
+        elif active:        status,color = "🔴 Violation",  "#ff4444"
+        elif score > 78:    status,color = "🟢 Focused",    "#00ff9d"
+        elif score > 55:    status,color = "🟡 Drifting",   "#ffcc00"
+        else:               status,color = "🔴 Not focused","#ff4444"
 
+        # Overlay
         font = cv2.FONT_HERSHEY_SIMPLEX
         sc   = (80,255,140) if score>78 else ((0,200,255) if score>55 else (80,80,255))
         for txt,y,col in [(f"Focus {int(score)}%",28,sc),
@@ -252,20 +307,21 @@ def process_frame(img_bytes, state, settings):
             cv2.putText(ann,txt,(12,y),font,0.55,(0,0,0),3,cv2.LINE_AA)
             cv2.putText(ann,txt,(12,y),font,0.55,col,    1,cv2.LINE_AA)
 
-        state.update({
-            "focus_score":       score,
-            "gaze_ui":           gaze_ui,
-            "blink_rate":        blink_rate,
-            "status":            status,
-            "color":             color,
-            "active_violations": [t for _,t in active],
-            "last_ann":          cv2.cvtColor(ann,cv2.COLOR_BGR2RGB),
-        })
-        return state
-    except Exception as e:
-        state["status"] = f"⚠️ Error"
-        state["color"]  = "#ff9900"
-        return state
+        if person_absent or active:
+            cv2.rectangle(ann,(0,0),(w,h),(0,0,200),4)
+
+        with self._lock:
+            self.last = {
+                "focus_score":       score,
+                "gaze":              gaze_ui,
+                "blink_rate":        blink_rate,
+                "session_time":      session_time,
+                "status":            status,
+                "color":             color,
+                "active_violations": [t for _,t in active],
+                "focus_scores":      list(self.focus_scores),
+            }
+        return av.VideoFrame.from_ndarray(ann, format="bgr24")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -483,18 +539,29 @@ def student_page():
     if exam["status"]=="pending":
         db["exams"][eid]["status"]="active"; st.rerun()
 
-    settings=dict(student_name=display,enable_telegram=exam.get("telegram",True),
-                  enable_yolo=True,track_absence=True,track_gaze=True,track_extra=True,
-                  track_phone=True,track_book=True,track_objects=True)
-
-    sk = f"st_{eid}"
-    if sk not in st.session_state:
-        st.session_state[sk] = make_state()
-    s = st.session_state[sk]
+    settings = dict(
+        student_name=display,
+        enable_telegram=exam.get("telegram", True),
+        enable_yolo=True,
+        track_absence=True, track_gaze=True, track_extra=True,
+        track_phone=True,   track_book=True, track_objects=True,
+    )
 
     col_cam, col_side = st.columns([2.2,1])
 
-    # ── Side panel ────────────────────────────────────────────────────────────
+    with col_cam:
+        st.subheader("🎥 Live Camera")
+        ctx = webrtc_streamer(
+            key=f"student_{eid}",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=FocusProcessor,
+            async_processing=True,
+        )
+        st.divider()
+        chart_ph = st.empty()
+
     with col_side:
         st.subheader("📊 Metrics")
         c1,c2=st.columns(2)
@@ -512,71 +579,36 @@ def student_page():
         st.warning("⚠️ Do not close this tab until you submit!")
         submit_btn = st.button("✅ Submit exam",type="primary",use_container_width=True)
 
-    # ── Camera panel ──────────────────────────────────────────────────────────
-    with col_cam:
-        st.subheader("🎥 Live Camera")
+    if ctx.video_processor:
+        ctx.video_processor.update_settings(settings)
 
-        # START button — shown before session begins
-        if not s["started"]:
-            if st.button("▶️ START SESSION", type="primary", use_container_width=True):
-                s["started"]       = True
-                s["session_start"] = time.time()
-                st.session_state[sk] = s
-                st.rerun()
-            st.info("Press **START SESSION** to begin proctoring")
-            ph_focus.metric("🎯 Focus","—")
-            ph_time.metric("⏱ Session","—")
-            ph_blink.metric("👁 Blinks/min","—")
-            ph_gaze.metric("👀 Gaze","—")
-            ph_status.markdown(
-                "<h3 style='color:#555;margin:0'>⏸ Press START</h3>",
-                unsafe_allow_html=True)
-            ph_viol.info("Start session to begin monitoring")
-            return
+    if ctx.video_processor:
+        with ctx.video_processor._lock:
+            d    = ctx.video_processor.last.copy()
+            vlog = list(ctx.video_processor.violations_log)
 
-        # STOP button
-        if st.button("⏹ STOP SESSION",use_container_width=True):
-            s["started"]=False; st.session_state[sk]=s; st.rerun()
+        session_time = int(d["session_time"])
+        mins = session_time//60; secs = session_time%60
+        time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
 
-        # JS: auto-click the "Take Photo" button every 2 seconds
-        # Camera must be fully visible and initialized first
-        components.html("""
-<script>
-(function() {
-    if (window._fgTimer) return;
-    function snap() {
-        try {
-            var btns = window.parent.document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {
-                if (btns[i].innerText.trim() === 'Take Photo') {
-                    btns[i].click();
-                    break;
-                }
-            }
-        } catch(e) {}
-    }
-    // First snap after 2 seconds (camera warmup), then every 2 seconds
-    setTimeout(function() {
-        snap();
-        window._fgTimer = setInterval(snap, 2000);
-    }, 2000);
-})();
-</script>
-""", height=0)
+        ph_focus.metric("🎯 Focus",      f"{int(d['focus_score'])}%")
+        ph_time.metric( "⏱ Session",    time_str)
+        ph_blink.metric("👁 Blinks/min", f"{d['blink_rate']:.1f}")
+        ph_gaze.metric( "👀 Gaze",       d["gaze"])
+        ph_status.markdown(
+            f"<h3 style='color:{d['color']};margin:0'>{d['status']}</h3>",
+            unsafe_allow_html=True)
 
-        # Camera widget — VISIBLE, NOT HIDDEN
-        # The "Take Photo" button is auto-clicked by JS above
-        camera_image = st.camera_input(
-            "Camera is active — frames are captured automatically",
-            key=f"cam_{eid}")
+        if vlog:
+            ph_viol.markdown("".join(f'<div class="vrow">{v}</div>' for v in vlog[:8]),
+                             unsafe_allow_html=True)
+        elif d["active_violations"]:
+            ph_viol.markdown("".join(f'<div class="vrow">{v}</div>' for v in d["active_violations"][:8]),
+                             unsafe_allow_html=True)
+        else:
+            ph_viol.success("No violations ✅")
 
-        # Show last AI-annotated frame
-        if s["last_ann"] is not None:
-            st.markdown("**🔴 LIVE · AI Analysis**")
-            st.image(s["last_ann"], use_container_width=True)
-
-        # Focus chart
-        fs = s["focus_scores"]
+        fs = d["focus_scores"]
         if len(fs) > 2:
             fig=go.Figure()
             fig.add_trace(go.Scatter(y=fs,mode="lines",
@@ -585,53 +617,34 @@ def student_page():
             fig.add_hline(y=78,line_color="rgba(0,255,157,0.3)",line_dash="dot")
             fig.add_hline(y=55,line_color="rgba(255,204,0,0.3)", line_dash="dot")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",height=180,showlegend=False,
+                plot_bgcolor="rgba(0,0,0,0)",height=200,showlegend=False,
                 margin=dict(l=0,r=0,t=8,b=0),
                 yaxis=dict(range=[0,100],ticksuffix="%",
                            gridcolor="rgba(255,255,255,0.05)",
                            tickfont=dict(color="#aaa")),
                 xaxis=dict(showgrid=False,showticklabels=False))
-            st.plotly_chart(fig,use_container_width=True,key=f"ch_{eid}")
-
-    # ── Process new frame ─────────────────────────────────────────────────────
-    if camera_image is not None and s["started"]:
-        img_bytes = camera_image.getvalue()
-        last_size = st.session_state.get(f"lsz_{eid}", -1)
-        if len(img_bytes) != last_size and len(img_bytes) > 1000:
-            st.session_state[f"lsz_{eid}"] = len(img_bytes)
-            s = process_frame(img_bytes, s, settings)
-            st.session_state[sk] = s
-
-    # ── Metrics display ───────────────────────────────────────────────────────
-    session_time = int(time.time()-s["session_start"]) if s["session_start"] else 0
-    mins = session_time//60; secs = session_time%60
-    time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-
-    ph_focus.metric("🎯 Focus",      f"{int(s['focus_score'])}%")
-    ph_time.metric( "⏱ Session",    time_str)
-    ph_blink.metric("👁 Blinks/min", f"{s['blink_rate']:.1f}")
-    ph_gaze.metric( "👀 Gaze",       s["gaze_ui"])
-    ph_status.markdown(
-        f"<h3 style='color:{s['color']};margin:0'>{s['status']}</h3>",
-        unsafe_allow_html=True)
-
-    vlog = s["violations_log"]
-    if vlog:
-        ph_viol.markdown("".join(f'<div class="vrow">{v}</div>' for v in vlog[:8]),
-                         unsafe_allow_html=True)
-    elif s["active_violations"]:
-        ph_viol.markdown("".join(f'<div class="vrow">{v}</div>' for v in s["active_violations"][:8]),
-                         unsafe_allow_html=True)
+            chart_ph.plotly_chart(fig,use_container_width=True,key=f"sc_{int(time.time()*4)}")
     else:
-        ph_viol.success("No violations ✅")
+        ph_focus.metric("🎯 Focus","—")
+        ph_time.metric("⏱ Session","—")
+        ph_blink.metric("👁 Blinks/min","—")
+        ph_gaze.metric("👀 Gaze","—")
+        ph_status.markdown("<h3 style='color:#555;margin:0'>⏸ Start camera</h3>",
+                           unsafe_allow_html=True)
+        ph_viol.info("Allow camera access to begin")
 
-    # ── Submit ────────────────────────────────────────────────────────────────
     if submit_btn:
-        fs=s["focus_scores"]; vlog=s["violations_log"]
-        db["exams"][eid]["result"]={
+        if ctx.video_processor:
+            with ctx.video_processor._lock:
+                d_final = ctx.video_processor.last.copy()
+                vlog    = list(ctx.video_processor.violations_log)
+            fs = d_final["focus_scores"]
+        else:
+            fs = []; vlog = []
+        db["exams"][eid]["result"] = {
             "avg_focus":  sum(fs)/len(fs) if fs else 0,
             "min_focus":  min(fs) if fs else 0,
-            "blink_rate": s["blink_rate"],
+            "blink_rate": d_final["blink_rate"] if ctx.video_processor else 0,
             "violations": len(vlog),
             "focus_scores": fs[-100:],
             "submitted_at": time.strftime("%H:%M:%S"),
@@ -639,9 +652,8 @@ def student_page():
         db["exams"][eid]["status"]="submitted"
         st.success("✅ Exam submitted!"); st.rerun()
 
-    # ── Auto-rerun every second for live timer ────────────────────────────────
-    if s["started"]:
-        time.sleep(1)
+    if ctx.state.playing:
+        time.sleep(0.2)
         st.rerun()
 
 
