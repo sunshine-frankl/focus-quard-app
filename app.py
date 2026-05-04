@@ -18,23 +18,18 @@ TELEGRAM_CHAT_ID   = "-1003964944926"
 
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
         {
-            "urls": ["turn:focus-guardian.metered.live:80"],
+            "urls": ["turn:focus-guardian.metered.live:80?transport=tcp"],
             "username": "11825cb12697cebbbaf737fb",
             "credential": "C5RojbMQe3DbPLhb",
         },
         {
-            "urls": ["turn:focus-guardian.metered.live:443"],
+            "urls": ["turns:focus-guardian.metered.live:443?transport=tcp"],
             "username": "11825cb12697cebbbaf737fb",
             "credential": "C5RojbMQe3DbPLhb",
         },
-        {
-            "urls": ["turns:focus-guardian.metered.live:443"],
-            "username": "11825cb12697cebbbaf737fb",
-            "credential": "C5RojbMQe3DbPLhb",
-        },
-    ]
+    ],
+    "iceTransportPolicy": "relay",
 })
 
 EAR_THRESHOLD       = 0.20
