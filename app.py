@@ -117,7 +117,9 @@ def process_frame(img_bytes, state, settings):
     try:
         arr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None: return state
+        if img is None:
+            return state
+
         h, w  = img.shape[:2]
         rgb   = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         res   = get_face_mesh().process(rgb)
@@ -130,7 +132,8 @@ def process_frame(img_bytes, state, settings):
         if res.multi_face_landmarks:
             for face_lm in res.multi_face_landmarks:
                 lm = face_lm.landmark
-                xs = [int(l.x*w) for l in lm]; ys = [int(l.y*h) for l in lm]
+                xs = [int(l.x*w) for l in lm]
+                ys = [int(l.y*h) for l in lm]
                 cv2.rectangle(ann,(max(0,min(xs)-8),max(0,min(ys)-8)),
                               (min(w,max(xs)+8),min(h,max(ys)+8)),(0,255,120),2)
                 for idx in L_EAR_IDX+R_EAR_IDX:
@@ -260,7 +263,8 @@ def process_frame(img_bytes, state, settings):
         })
         return state
     except Exception as e:
-        state["status"] = f"⚠️ {str(e)[:50]}"
+        state["status"] = f"⚠️ Error"
+        state["color"]  = "#ff9900"
         return state
 
 
@@ -282,7 +286,7 @@ def get_db():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PAGE CONFIG & STYLES
+#  STYLES
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Focus Guard", page_icon="🧠", layout="wide")
 st.markdown("""
@@ -294,22 +298,9 @@ st.markdown("""
       padding:7px 12px;margin:4px 0;color:#ffaaaa;font-size:.88rem}
 .exam-card{background:#1c2333;border-radius:10px;padding:16px 20px;
            border:1px solid #2a3550;margin-bottom:10px}
-.badge-pending{background:#2a2000;color:#ffd60a;border-radius:4px;
-               padding:2px 8px;font-size:.78rem}
-.badge-active{background:#002a0a;color:#00ff9d;border-radius:4px;
-              padding:2px 8px;font-size:.78rem}
-.badge-submitted{background:#00152a;color:#00b4ff;border-radius:4px;
-                 padding:2px 8px;font-size:.78rem}
-/* Hide the default camera_input UI — we only need its internal capture */
-div[data-testid="stCameraInput"] > div:first-child {
-    display: none !important;
-}
-div[data-testid="stCameraInput"] button {
-    display: none !important;
-}
-div[data-testid="stCameraInput"] video {
-    display: none !important;
-}
+.badge-pending{background:#2a2000;color:#ffd60a;border-radius:4px;padding:2px 8px;font-size:.78rem}
+.badge-active{background:#002a0a;color:#00ff9d;border-radius:4px;padding:2px 8px;font-size:.78rem}
+.badge-submitted{background:#00152a;color:#00b4ff;border-radius:4px;padding:2px 8px;font-size:.78rem}
 </style>""", unsafe_allow_html=True)
 
 ROLE_ICON = {"admin":"🛡️","teacher":"👨‍🏫","student":"🎓"}
@@ -503,6 +494,7 @@ def student_page():
 
     col_cam, col_side = st.columns([2.2,1])
 
+    # ── Side panel ────────────────────────────────────────────────────────────
     with col_side:
         st.subheader("📊 Metrics")
         c1,c2=st.columns(2)
@@ -520,76 +512,68 @@ def student_page():
         st.warning("⚠️ Do not close this tab until you submit!")
         submit_btn = st.button("✅ Submit exam",type="primary",use_container_width=True)
 
+    # ── Camera panel ──────────────────────────────────────────────────────────
     with col_cam:
         st.subheader("🎥 Live Camera")
 
+        # START button — shown before session begins
         if not s["started"]:
             if st.button("▶️ START SESSION", type="primary", use_container_width=True):
                 s["started"]       = True
                 s["session_start"] = time.time()
                 st.session_state[sk] = s
                 st.rerun()
-            st.info("Press **START SESSION** to begin monitoring")
+            st.info("Press **START SESSION** to begin proctoring")
             ph_focus.metric("🎯 Focus","—")
             ph_time.metric("⏱ Session","—")
             ph_blink.metric("👁 Blinks/min","—")
             ph_gaze.metric("👀 Gaze","—")
-            ph_status.markdown("<h3 style='color:#555;margin:0'>⏸ Press START</h3>",
-                               unsafe_allow_html=True)
+            ph_status.markdown(
+                "<h3 style='color:#555;margin:0'>⏸ Press START</h3>",
+                unsafe_allow_html=True)
             ph_viol.info("Start session to begin monitoring")
             return
 
         # STOP button
-        if st.button("⏹ STOP",use_container_width=True):
+        if st.button("⏹ STOP SESSION",use_container_width=True):
             s["started"]=False; st.session_state[sk]=s; st.rerun()
 
-        # ── Live video via JS webcam capture ──────────────────────────────────
-        # This component opens the webcam via browser JS, captures frames every
-        # 2 seconds, and auto-clicks the hidden st.camera_input button
+        # JS: auto-click the "Take Photo" button every 2 seconds
+        # Camera must be fully visible and initialized first
         components.html("""
 <script>
 (function() {
-    var interval = null;
-
-    function clickCapture() {
+    if (window._fgTimer) return;
+    function snap() {
         try {
-            // Find Take Photo button in parent document
-            var doc = window.parent.document;
-            var btns = doc.querySelectorAll('button');
+            var btns = window.parent.document.querySelectorAll('button');
             for (var i = 0; i < btns.length; i++) {
-                if (btns[i].innerText && btns[i].innerText.trim() === 'Take Photo') {
+                if (btns[i].innerText.trim() === 'Take Photo') {
                     btns[i].click();
-                    return;
+                    break;
                 }
             }
         } catch(e) {}
     }
-
-    // Start clicking every 2 seconds
-    if (!window._focusGuardStarted) {
-        window._focusGuardStarted = true;
-        // Wait 1s for camera to initialize, then click every 2s
-        setTimeout(function() {
-            clickCapture();
-            interval = setInterval(clickCapture, 2000);
-        }, 1000);
-    }
+    // First snap after 2 seconds (camera warmup), then every 2 seconds
+    setTimeout(function() {
+        snap();
+        window._fgTimer = setInterval(snap, 2000);
+    }, 2000);
 })();
 </script>
 """, height=0)
 
-        # Hidden camera input — JS will auto-click it
-        camera_image = st.camera_input("",
-                                       key=f"cam_{eid}",
-                                       label_visibility="collapsed")
+        # Camera widget — VISIBLE, NOT HIDDEN
+        # The "Take Photo" button is auto-clicked by JS above
+        camera_image = st.camera_input(
+            "Camera is active — frames are captured automatically",
+            key=f"cam_{eid}")
 
-        # Show processed (annotated) frame
-        ph_frame = st.empty()
+        # Show last AI-annotated frame
         if s["last_ann"] is not None:
-            ph_frame.image(s["last_ann"], use_container_width=True,
-                           caption="🔴 LIVE · AI Analysis")
-        else:
-            ph_frame.info("🔄 Initializing camera...")
+            st.markdown("**🔴 LIVE · AI Analysis**")
+            st.image(s["last_ann"], use_container_width=True)
 
         # Focus chart
         fs = s["focus_scores"]
@@ -609,16 +593,16 @@ def student_page():
                 xaxis=dict(showgrid=False,showticklabels=False))
             st.plotly_chart(fig,use_container_width=True,key=f"ch_{eid}")
 
-    # Process new frame if available
+    # ── Process new frame ─────────────────────────────────────────────────────
     if camera_image is not None and s["started"]:
         img_bytes = camera_image.getvalue()
         last_size = st.session_state.get(f"lsz_{eid}", -1)
-        if len(img_bytes) != last_size:
+        if len(img_bytes) != last_size and len(img_bytes) > 1000:
             st.session_state[f"lsz_{eid}"] = len(img_bytes)
             s = process_frame(img_bytes, s, settings)
             st.session_state[sk] = s
 
-    # Metrics
+    # ── Metrics display ───────────────────────────────────────────────────────
     session_time = int(time.time()-s["session_start"]) if s["session_start"] else 0
     mins = session_time//60; secs = session_time%60
     time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
@@ -641,7 +625,7 @@ def student_page():
     else:
         ph_viol.success("No violations ✅")
 
-    # Submit
+    # ── Submit ────────────────────────────────────────────────────────────────
     if submit_btn:
         fs=s["focus_scores"]; vlog=s["violations_log"]
         db["exams"][eid]["result"]={
@@ -655,7 +639,7 @@ def student_page():
         db["exams"][eid]["status"]="submitted"
         st.success("✅ Exam submitted!"); st.rerun()
 
-    # Auto-rerun every second for live timer + processing
+    # ── Auto-rerun every second for live timer ────────────────────────────────
     if s["started"]:
         time.sleep(1)
         st.rerun()
