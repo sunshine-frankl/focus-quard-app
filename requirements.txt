@@ -8,3 +8,4 @@ aiortc
 av
 requests
 ultralytics
+tornado
