@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Системные библиотеки для mediapipe, cv2, aiortc
 RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libgl1-mesa-glx \
@@ -20,7 +19,4 @@ COPY . .
 
 EXPOSE $PORT
 
-CMD streamlit run app.py \
-    --server.port=$PORT \
-    --server.address=0.0.0.0 \
-    --server.headless=true
+CMD streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
