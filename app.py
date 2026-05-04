@@ -15,7 +15,27 @@ from streamlit_webrtc import (
 
 TELEGRAM_BOT_TOKEN = "8702324957:AAE45czlrbs5nt9q7uxxwgukArUpNjoZ-j0"
 TELEGRAM_CHAT_ID   = "-1003964944926"
-RTC_CONFIGURATION  = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {
+            "urls": ["turn:focus-guardian.metered.live:80"],
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+        {
+            "urls": ["turn:focus-guardian.metered.live:443"],
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+        {
+            "urls": ["turns:focus-guardian.metered.live:443"],
+            "username": "11825cb12697cebbbaf737fb",
+            "credential": "C5RojbMQe3DbPLhb",
+        },
+    ]
+})
 
 EAR_THRESHOLD       = 0.20
 EAR_CONSEC_FRAMES   = 3
@@ -56,7 +76,6 @@ def iris_ratio(lm, iris_idx, eye_left_idx, eye_right_idx, w, h):
     return (ix - ex_l) / width
 
 
-# ── Resources (NO cache_resource — fixes WebRTC thread crash) ──────────────────
 def load_face_mesh():
     return mp.solutions.face_mesh.FaceMesh(
         max_num_faces=4,
@@ -109,12 +128,11 @@ def get_notifier():
     return _N()
 
 
-# ── Video Processor ────────────────────────────────────────────────────────────
 class FocusProcessor(VideoProcessorBase):
     def __init__(self):
         self._lock           = threading.Lock()
         self.settings        = {}
-        self.face_mesh       = load_face_mesh()   # создаётся в потоке WebRTC
+        self.face_mesh       = load_face_mesh()
         self.yolo            = load_yolo()
         self.notifier        = get_notifier()
         self.session_start   = time.time()
@@ -367,7 +385,6 @@ def login_page():
         st.caption("AI Proctoring System · Please sign in")
         st.divider()
 
-        # ── Быстрый вход одной кнопкой ────────────────────────────────────
         st.markdown("**Quick login:**")
         c1, c2, c3 = st.columns(3)
         if c1.button("🛡️ Admin",   use_container_width=True):
